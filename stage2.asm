@@ -60,6 +60,15 @@ cli_main:
     mov edi, (14 * 80 + 0) * 2
     mov esi, msg_prompt
     call print_string_pm
+
+    ; Example of how to call the fat_read_file function
+    ; We would need to pass a filename, and a buffer to load the file into.
+    ; For now, we just call the placeholder.
+    mov edi, (15 * 80 + 0) * 2
+    mov esi, msg_loading_file
+    call print_string_pm
+    call fat_read_file
+
     jmp halt
 
 print_string_pm:
@@ -161,6 +170,54 @@ to_hex_char:
     add al, '0'
     ret
 
+; FAT12 Boot Sector Structure
+struc fat12_bpb
+    .BS_jmpBoot         resb 3
+    .BS_OEMName         resb 8
+    .BPB_BytsPerSec     resw 1
+    .BPB_SecPerClus     resb 1
+    .BPB_RsvdSecCnt     resw 1
+    .BPB_NumFATs        resb 1
+    .BPB_RootEntCnt     resw 1
+    .BPB_TotSec16       resw 1
+    .BPB_Media          resb 1
+    .BPB_FATSz16        resw 1
+    .BPB_SecPerTrk      resw 1
+    .BPB_NumHeads       resw 1
+    .BPB_HiddSec        resd 1
+    .BPB_TotSec32       resd 1
+    .BS_DrvNum          resb 1
+    .BS_Reserved1       resb 1
+    .BS_BootSig         resb 1
+    .BS_VolID           resd 1
+    .BS_VolLab          resb 11
+    .BS_FilSysType      resb 8
+endstruc
+
+fat_read_file:
+    ; Placeholder for reading a file from a FAT12 filesystem.
+    ; This would involve:
+    ; 1. Reading the boot sector to get filesystem info.
+    ; 2. Finding the root directory.
+    ; 3. Searching the root directory for the file.
+    ; 4. Finding the first cluster of the file.
+    ; 5. Following the cluster chain in the FAT.
+    ; 6. Reading the file's data from the data region.
+    ;
+    ; This requires a disk driver to read sectors from the disk,
+    ; as we are in protected mode and cannot use BIOS interrupts.
+    ret
+
+fat_write_file:
+    ; Placeholder for writing a file to a FAT12 filesystem.
+    ; This is more complex than reading and would involve:
+    ; 1. Finding an empty directory entry.
+    ; 2. Finding free clusters in the FAT.
+    ; 3. Writing the file data to the clusters.
+    ; 4. Updating the FAT to create a cluster chain.
+    ; 5. Updating the directory entry with file info.
+    ret
+
 gdt_start:
     dd 0, 0
     dw 0xffff, 0, 0x9a00, 0x00cf
@@ -176,6 +233,7 @@ idt_descriptor:
     dd idt
 
 msg_prompt db '> ', 0
+msg_loading_file db 'Attempting to load a file...', 0
 ascii_art_line1 db '  ######  #####  #####  #####   ', 0
 ascii_art_line2 db '  #    #  #   #  #   #  #   #  ', 0
 ascii_art_line3 db '  #    #  #   #  #   #  #      ', 0
@@ -198,6 +256,10 @@ scancode_map:
     times 256 - ($ - scancode_map) db 0
 
 section .bss
+boot_sector:
+    resb 512
+cluster_buffer:
+    resb 4096
 shift_pressed: resb 1
 idt:
     resb 256 * 8
