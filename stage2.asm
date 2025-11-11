@@ -194,18 +194,87 @@ struc fat12_bpb
     .BS_FilSysType      resb 8
 endstruc
 
+; ATA PIO Port Definitions
+ATA_PRIMARY_DATA equ 0x1F0
+ATA_PRIMARY_ERROR equ 0x1F1
+ATA_PRIMARY_SECTOR_COUNT equ 0x1F2
+ATA_PRIMARY_LBA_LOW equ 0x1F3
+ATA_PRIMARY_LBA_MID equ 0x1F4
+ATA_PRIMARY_LBA_HIGH equ 0x1F5
+ATA_PRIMARY_DRIVE_HEAD equ 0x1F6
+ATA_PRIMARY_COMMAND equ 0x1F7
+ATA_PRIMARY_STATUS equ 0x1F7
+
+ata_read_sector:
+    ; Reads a single sector from the disk using PIO mode.
+    ; eax: LBA of the sector to read
+    ; edi: memory address to store the sector
+
+    ; Select drive (Master) and set LBA mode
+    mov dx, ATA_PRIMARY_DRIVE_HEAD
+    mov al, 0xE0
+    out dx, al
+
+    ; Set sector count to 1
+    mov dx, ATA_PRIMARY_SECTOR_COUNT
+    mov al, 1
+    out dx, al
+
+    ; Set LBA
+    mov edx, ATA_PRIMARY_LBA_LOW
+    out dx, al ; LBA bits 0-7
+    shr eax, 8
+    mov edx, ATA_PRIMARY_LBA_MID
+    out dx, al ; LBA bits 8-15
+    shr eax, 8
+    mov edx, ATA_PRIMARY_LBA_HIGH
+    out dx, al ; LBA bits 16-23
+    shr eax, 8
+    and al, 0x0F ; LBA bits 24-27
+    or al, 0xE0 ; LBA mode
+    mov edx, ATA_PRIMARY_DRIVE_HEAD
+    out dx, al
+
+    ; Send read command
+    mov dx, ATA_PRIMARY_COMMAND
+    mov al, 0x20
+    out dx, al
+
+    ; Wait for the drive to be ready
+.wait:
+    mov dx, ATA_PRIMARY_STATUS
+    in al, dx
+    test al, 0x80 ; BSY bit
+    jnz .wait
+    test al, 0x08 ; DRQ bit
+    jz .wait
+
+    ; Read the sector data
+    mov ecx, 256
+    mov dx, ATA_PRIMARY_DATA
+    rep insw
+
+    ret
+
 fat_read_file:
-    ; Placeholder for reading a file from a FAT12 filesystem.
-    ; This would involve:
-    ; 1. Reading the boot sector to get filesystem info.
-    ; 2. Finding the root directory.
-    ; 3. Searching the root directory for the file.
-    ; 4. Finding the first cluster of the file.
-    ; 5. Following the cluster chain in the FAT.
-    ; 6. Reading the file's data from the data region.
-    ;
-    ; This requires a disk driver to read sectors from the disk,
-    ; as we are in protected mode and cannot use BIOS interrupts.
+    ; Reads a file from a FAT12 filesystem.
+    ; For now, it just reads the boot sector and prints some info.
+
+    ; Read boot sector (LBA 0)
+    mov eax, 0
+    mov edi, boot_sector
+    call ata_read_sector
+
+    ; Print BytesPerSec
+    movzx eax, word [boot_sector + fat12_bpb.BPB_BytsPerSec]
+    mov edi, (16 * 80 + 0) * 2
+    call print_hex
+
+    ; Print SecPerClus
+    movzx eax, byte [boot_sector + fat12_bpb.BPB_SecPerClus]
+    mov edi, (17 * 80 + 0) * 2
+    call print_hex
+
     ret
 
 fat_write_file:
@@ -216,6 +285,24 @@ fat_write_file:
     ; 3. Writing the file data to the clusters.
     ; 4. Updating the FAT to create a cluster chain.
     ; 5. Updating the directory entry with file info.
+    ret
+
+print_hex:
+    ; Prints a 32-bit hex value in eax to the screen.
+    ; edi: screen position
+    pushad
+    mov ebx, 0xb8000
+    add ebx, edi
+    mov ecx, 8
+.loop:
+    rol eax, 4
+    mov edx, eax
+    and edx, 0x0F
+    call to_hex_char
+    mov [ebx], dl
+    add ebx, 2
+    loop .loop
+    popad
     ret
 
 gdt_start:
