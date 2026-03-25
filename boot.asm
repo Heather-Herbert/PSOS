@@ -32,6 +32,29 @@ start_boot:
     mov ds, ax
     mov es, ax
 
+    ; --- E820 memory map query ---
+    ; Layout: dword entry count at 0x500, then 24-byte entries from 0x504.
+    ; 24 bytes = 8 (base) + 8 (length) + 4 (type) + 4 (ACPI 3.0 attrs).
+    ; Must be done in real mode before the protected-mode switch.
+    mov dword [0x500], 0    ; initialise entry count
+    mov di, 0x504           ; ES:DI = 0x0000:0x504 (ES=0 set above)
+    xor ebx, ebx            ; EBX=0 starts the E820 enumeration
+
+.e820_loop:
+    mov eax, 0xE820
+    mov ecx, 24             ; request 24-byte (ACPI 3.0) entries
+    mov edx, 0x534D4150     ; signature 'SMAP'
+    int 0x15
+    jc .e820_done           ; carry set: end of list or unsupported
+    cmp eax, 0x534D4150     ; BIOS must echo 'SMAP' back in EAX
+    jne .e820_done
+    inc dword [0x500]       ; one more valid entry
+    add di, 24              ; advance buffer pointer
+    test ebx, ebx           ; EBX=0 after last entry
+    jnz .e820_loop
+
+.e820_done:
+
     ; Load stage2 from disk
     mov ah, 0x02 ; Read sectors
     mov al, 4    ; Number of sectors to read

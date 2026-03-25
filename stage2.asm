@@ -36,6 +36,8 @@ protected_mode:
     mov ah, 0x17
     rep stosw
 
+    call print_e820_map
+
     mov edi, (5 * 80 + 25) * 2
     mov esi, ascii_art_line1
     call print_string_pm
@@ -262,6 +264,62 @@ to_hex_char:
 .is_digit:
     add al, '0'
     ret
+
+; --- E820 memory map (written by boot.asm before PM switch) ---
+E820_COUNT   equ 0x500   ; dword: number of entries
+E820_ENTRIES equ 0x504   ; array of 24-byte entries:
+                         ;   +0  qword base address
+                         ;   +8  qword length
+                         ;   +16 dword type (1=usable,2=reserved,3=ACPI,4=NVS,5=bad)
+                         ;   +20 dword ACPI 3.0 extended attributes
+
+; print_e820_map
+; Reads the E820 map left by the bootloader and prints each entry to VGA.
+; Rows 0..(count-1), format: "BASE=XXXXXXXX LEN=XXXXXXXX TYPE=X"
+; Clobbers: eax, ebx, ecx, edx, esi, edi
+print_e820_map:
+    mov ecx, [E820_COUNT]
+    test ecx, ecx
+    jz .done
+
+    mov ebx, E820_ENTRIES   ; pointer to current entry
+    xor edx, edx            ; row counter
+
+.entry_loop:
+    ; Print "BASE=XXXXXXXX LEN=XXXXXXXX TYPE=XXXXXXXX"
+    ; edi is the VGA byte offset; print_string_pm advances it,
+    ; but print_hex uses pushad/popad so edi must be manually advanced
+    ; by 8*2=16 after each print_hex call.
+    mov edi, edx
+    imul edi, 80 * 2        ; start of row
+
+    mov esi, msg_e820_base
+    call print_string_pm    ; edi now past "BASE="
+    mov eax, [ebx]          ; base low 32 bits
+    call print_hex
+    add edi, 8 * 2          ; advance past 8 hex digits
+
+    mov esi, msg_e820_len
+    call print_string_pm    ; edi now past " LEN="
+    mov eax, [ebx + 8]      ; length low 32 bits
+    call print_hex
+    add edi, 8 * 2
+
+    mov esi, msg_e820_type
+    call print_string_pm    ; edi now past " TYPE="
+    mov eax, [ebx + 16]     ; type
+    call print_hex
+
+    inc edx
+    add ebx, 24
+    loop .entry_loop
+
+.done:
+    ret
+
+msg_e820_base db 'BASE=', 0
+msg_e820_len  db ' LEN=', 0
+msg_e820_type db ' TYPE=', 0
 
 ; FAT12 Boot Sector Structure
 struc fat12_bpb
