@@ -27,10 +27,14 @@ start:
     db 'FAT12   ' ; Filesystem type
 
 start_boot:
-    ; Normalise segments so ES:BX and the subsequent far jump are reliable
+    ; Normalise segments and establish an explicit stack.
+    ; Loading SS inhibits interrupts for the following instruction (SP load),
+    ; guaranteeing an atomic SS:SP update.
     xor ax, ax
     mov ds, ax
     mov es, ax
+    mov ss, ax
+    mov sp, 0x7C00      ; stack grows down from boot sector base
 
     ; --- E820 memory map query ---
     ; Layout: dword entry count at 0x500, then 24-byte entries from 0x504.
@@ -54,6 +58,10 @@ start_boot:
     jnz .e820_loop
 
 .e820_done:
+
+    ; Re-zero AX and ES: the BIOS E820 handler may have clobbered them.
+    xor ax, ax
+    mov es, ax
 
     ; Load stage2 from disk
     mov ah, 0x02 ; Read sectors

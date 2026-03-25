@@ -286,27 +286,35 @@ print_e820_map:
     xor edx, edx            ; row counter
 
 .entry_loop:
-    ; Print "BASE=XXXXXXXX LEN=XXXXXXXX TYPE=XXXXXXXX"
-    ; edi is the VGA byte offset; print_string_pm advances it,
-    ; but print_hex uses pushad/popad so edi must be manually advanced
-    ; by 8*2=16 after each print_hex call.
+    ; print_string_pm clobbers EBX (sets it to 0xb8000), so push/pop it
+    ; around every call to keep the entry pointer intact.
+    ; print_hex uses pushad/popad so it preserves EBX automatically.
+    ; edi is the VGA byte offset; print_string_pm advances it per char,
+    ; but print_hex does not — manually add 8*2 after each print_hex.
+
     mov edi, edx
     imul edi, 80 * 2        ; start of row
 
+    push ebx
     mov esi, msg_e820_base
     call print_string_pm    ; edi now past "BASE="
+    pop ebx
     mov eax, [ebx]          ; base low 32 bits
     call print_hex
     add edi, 8 * 2          ; advance past 8 hex digits
 
+    push ebx
     mov esi, msg_e820_len
     call print_string_pm    ; edi now past " LEN="
+    pop ebx
     mov eax, [ebx + 8]      ; length low 32 bits
     call print_hex
     add edi, 8 * 2
 
+    push ebx
     mov esi, msg_e820_type
     call print_string_pm    ; edi now past " TYPE="
+    pop ebx
     mov eax, [ebx + 16]     ; type
     call print_hex
 
