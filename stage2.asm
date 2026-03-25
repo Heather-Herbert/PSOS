@@ -2,6 +2,12 @@ bits 16
 org 0x8000
 
 start_stage2:
+    ; Ensure DS=0 so that lgdt reads the GDT descriptor from the correct
+    ; physical address. If DS is non-zero the CPU loads a garbage GDTR and
+    ; the subsequent far jump triple-faults.
+    xor ax, ax
+    mov ds, ax
+
     cli
     lgdt [gdt_descriptor]
     mov eax, cr0
@@ -17,6 +23,7 @@ protected_mode:
     mov fs, ax
     mov gs, ax
     mov ss, ax
+    mov esp, stack_top
 
     call pic_remap
     call idt_setup
@@ -56,18 +63,104 @@ protected_mode:
 halt:
     hlt
 
+msg_test_pass db 'PASS', 0
+msg_test_fail db 'FAIL', 0
+msg_test_write_pass db 'WRITE PASS', 0
+msg_test_write_fail db 'WRITE FAIL', 0
+
+test_read_boot_sector:
+    ; Test if the boot sector is read correctly.
+    ; It checks if BytesPerSec is 512.
+    movzx eax, word [boot_sector + fat12_bpb.BPB_BytsPerSec]
+    cmp eax, 512
+    je .pass
+.fail:
+    mov esi, msg_test_fail
+    call print_string_pm
+    ret
+.pass:
+    mov esi, msg_test_pass
+    call print_string_pm
+    ret
+
+test_disk_write:
+    ; Test writing to disk.
+    ; 1. Read sector 10 into buffer.
+    ; 2. Modify buffer.
+    ; 3. Write sector 10.
+    ; 4. Read sector 10 into a different buffer (or same, clearing it first).
+    ; 5. Verify modification.
+
+    ; Use cluster_buffer for this test.
+    
+    ; Step 1: Read Sector 10
+    mov eax, 10
+    mov edi, cluster_buffer
+    call ata_read_sector
+    jc .fail
+
+    ; Step 2: Modify buffer (first dword)
+    mov dword [cluster_buffer], 0xDEADBEEF
+
+    ; Step 3: Write Sector 10
+    mov eax, 10
+    mov esi, cluster_buffer
+    call ata_write_sector
+    jc .fail
+
+    ; Step 4: Clear buffer to ensure we are reading fresh data
+    mov dword [cluster_buffer], 0
+
+    ; Step 5: Read Sector 10 again
+    mov eax, 10
+    mov edi, cluster_buffer
+    call ata_read_sector
+    jc .fail
+
+    ; Step 6: Verify
+    cmp dword [cluster_buffer], 0xDEADBEEF
+    je .pass
+
+.fail:
+    mov esi, msg_test_write_fail
+    call print_string_pm
+    ret
+
+.pass:
+    mov esi, msg_test_write_pass
+    call print_string_pm
+    ret
+
+run_tests:
+    call fat_read_file
+
+    ; Print the first byte of the boot sector
+    mov al, [boot_sector]
+    movzx eax, al
+    mov edi, (21 * 80 + 0) * 2 ; New line
+    call print_hex
+
+    jc .error ; Now check the carry flag
+
+    mov edi, (20 * 80 + 0) * 2
+    call test_read_boot_sector
+
+    mov edi, (22 * 80 + 0) * 2
+    call test_disk_write
+    ret
+
+.error:
+    mov edi, (20 * 80 + 0) * 2
+    mov esi, msg_test_fail
+    call print_string_pm
+    ret
+
 cli_main:
     mov edi, (14 * 80 + 0) * 2
     mov esi, msg_prompt
     call print_string_pm
 
-    ; Example of how to call the fat_read_file function
-    ; We would need to pass a filename, and a buffer to load the file into.
-    ; For now, we just call the placeholder.
-    mov edi, (15 * 80 + 0) * 2
-    mov esi, msg_loading_file
-    call print_string_pm
-    call fat_read_file
+    call run_tests
 
     jmp halt
 
@@ -209,31 +302,39 @@ ata_read_sector:
     ; Reads a single sector from the disk using PIO mode.
     ; eax: LBA of the sector to read
     ; edi: memory address to store the sector
+    ; returns: carry flag set on error
 
-    ; Select drive (Master) and set LBA mode
+    ; eax has the LBA.
+    ; edi has the buffer.
+
+    ; Save LBA
+    push eax
+
+    ; Send head and high 4 bits of LBA
     mov dx, ATA_PRIMARY_DRIVE_HEAD
-    mov al, 0xE0
+    shr eax, 24
+    or al, 0xE0 ; Master drive, LBA mode
     out dx, al
 
-    ; Set sector count to 1
+    ; Restore LBA
+    pop eax
+
+    ; Send sector count (save/restore eax so al is not clobbered before LBA_LOW)
+    push eax
     mov dx, ATA_PRIMARY_SECTOR_COUNT
     mov al, 1
     out dx, al
+    pop eax
 
-    ; Set LBA
-    mov edx, ATA_PRIMARY_LBA_LOW
-    out dx, al ; LBA bits 0-7
+    ; Send LBA low, mid, high
+    mov dx, ATA_PRIMARY_LBA_LOW
+    out dx, al          ; al = LBA[7:0]
     shr eax, 8
-    mov edx, ATA_PRIMARY_LBA_MID
-    out dx, al ; LBA bits 8-15
+    mov dx, ATA_PRIMARY_LBA_MID
+    out dx, al          ; al = LBA[15:8]
     shr eax, 8
-    mov edx, ATA_PRIMARY_LBA_HIGH
-    out dx, al ; LBA bits 16-23
-    shr eax, 8
-    and al, 0x0F ; LBA bits 24-27
-    or al, 0xE0 ; LBA mode
-    mov edx, ATA_PRIMARY_DRIVE_HEAD
-    out dx, al
+    mov dx, ATA_PRIMARY_LBA_HIGH
+    out dx, al          ; al = LBA[23:16]
 
     ; Send read command
     mov dx, ATA_PRIMARY_COMMAND
@@ -241,40 +342,159 @@ ata_read_sector:
     out dx, al
 
     ; Wait for the drive to be ready
-.wait:
+    mov ecx, 1000000
+.poll_status:
+    dec ecx
+    jz .timeout
+
     mov dx, ATA_PRIMARY_STATUS
     in al, dx
-    test al, 0x80 ; BSY bit
-    jnz .wait
-    test al, 0x08 ; DRQ bit
-    jz .wait
 
+    test al, 0x80 ; BSY bit
+    jnz .poll_status
+
+    test al, 0x01 ; ERR bit
+    jnz .error
+
+    test al, 0x08 ; DRQ bit
+    jz .poll_status
+
+    jmp .read_data
+
+.timeout:
+    stc ; Set carry flag to indicate timeout
+    ret
+
+.error:
+    stc ; Set carry flag to indicate error
+    ret
+
+.read_data:
     ; Read the sector data
     mov ecx, 256
     mov dx, ATA_PRIMARY_DATA
     rep insw
 
+    clc ; Clear carry flag to indicate success
+    ret
+
+ata_write_sector:
+    ; Writes a single sector to the disk using PIO mode.
+    ; eax: LBA of the sector to write
+    ; esi: memory address of the data to write
+    ; returns: carry flag set on error
+
+    ; Save LBA
+    push eax
+
+    ; Send head and high 4 bits of LBA
+    mov dx, ATA_PRIMARY_DRIVE_HEAD
+    shr eax, 24
+    or al, 0xE0 ; Master drive, LBA mode
+    out dx, al
+
+    ; Restore LBA
+    pop eax
+
+    ; Send sector count (save/restore eax so al is not clobbered before LBA_LOW)
+    push eax
+    mov dx, ATA_PRIMARY_SECTOR_COUNT
+    mov al, 1
+    out dx, al
+    pop eax
+
+    ; Send LBA low, mid, high
+    mov dx, ATA_PRIMARY_LBA_LOW
+    out dx, al          ; al = LBA[7:0]
+    shr eax, 8
+    mov dx, ATA_PRIMARY_LBA_MID
+    out dx, al          ; al = LBA[15:8]
+    shr eax, 8
+    mov dx, ATA_PRIMARY_LBA_HIGH
+    out dx, al          ; al = LBA[23:16]
+
+    ; Send write command
+    mov dx, ATA_PRIMARY_COMMAND
+    mov al, 0x30 ; Write Sectors
+    out dx, al
+
+    ; Wait for the drive to be ready
+    mov ecx, 1000000
+.poll_status:
+    dec ecx
+    jz .timeout
+
+    mov dx, ATA_PRIMARY_STATUS
+    in al, dx
+
+    test al, 0x80 ; BSY bit
+    jnz .poll_status
+
+    test al, 0x01 ; ERR bit
+    jnz .error
+
+    test al, 0x08 ; DRQ bit
+    jz .poll_status
+
+    jmp .write_data
+
+.timeout:
+    stc ; Set carry flag to indicate timeout
+    ret
+
+.error:
+    stc ; Set carry flag to indicate error
+    ret
+
+.write_data:
+    ; Write the sector data
+    mov ecx, 256
+    mov dx, ATA_PRIMARY_DATA
+    rep outsw
+
+    ; Flush cache / wait for completion
+    ; (Ideally we should poll BSY again or use Cache Flush command 0xE7)
+    ; For simple PIO write, waiting for BSY to clear is usually enough.
+    mov ecx, 1000000
+.poll_finish:
+    dec ecx
+    jz .timeout_finish
+    mov dx, ATA_PRIMARY_STATUS
+    in al, dx
+    test al, 0x80 ; BSY
+    jnz .poll_finish
+    test al, 0x01 ; ERR
+    jnz .error
+
+    clc
+    ret
+
+.timeout_finish:
+    stc
     ret
 
 fat_read_file:
     ; Reads a file from a FAT12 filesystem.
-    ; For now, it just reads the boot sector and prints some info.
+    ; For now, it just reads the boot sector.
+    ; returns: carry flag set on error
+
+    cli ; Disable interrupts
 
     ; Read boot sector (LBA 0)
     mov eax, 0
     mov edi, boot_sector
     call ata_read_sector
 
-    ; Print BytesPerSec
-    movzx eax, word [boot_sector + fat12_bpb.BPB_BytsPerSec]
-    mov edi, (16 * 80 + 0) * 2
-    call print_hex
+    sti ; Re-enable interrupts
 
-    ; Print SecPerClus
-    movzx eax, byte [boot_sector + fat12_bpb.BPB_SecPerClus]
-    mov edi, (17 * 80 + 0) * 2
-    call print_hex
+    jc .error
 
+    clc ; Clear carry flag to indicate success
+    ret
+
+.error:
+    sti ; Make sure interrupts are re-enabled on error
+    stc ; Set carry flag to indicate error
     ret
 
 fat_write_file:
@@ -296,10 +516,18 @@ print_hex:
     mov ecx, 8
 .loop:
     rol eax, 4
-    mov edx, eax
-    and edx, 0x0F
+
+    ; copy the low 4 bits of eax to al
+    push eax
+    and al, 0x0F
     call to_hex_char
-    mov [ebx], dl
+    ; al now has the character
+
+    ; write it to screen
+    mov [ebx], al
+
+    pop eax
+
     add ebx, 2
     loop .loop
     popad
@@ -323,9 +551,9 @@ msg_prompt db '> ', 0
 msg_loading_file db 'Attempting to load a file...', 0
 ascii_art_line1 db '  ######  #####  #####  #####   ', 0
 ascii_art_line2 db '  #    #  #   #  #   #  #   #  ', 0
-ascii_art_line3 db '  #    #  #   #  #   #  #      ', 0
+ascii_art_line3 db '  #    #  #      #   #  #      ', 0
 ascii_art_line4 db '  ######  #####  #   #  #####  ', 0
-ascii_art_line5 db '  #       #   #  #   #      # ', 0
+ascii_art_line5 db '  #           #  #   #      # ', 0
 ascii_art_line6 db '  #       #   #  #   #  #   #  ', 0
 ascii_art_line7 db '  #       #####  #####  #####   ', 0
 
@@ -343,10 +571,29 @@ scancode_map:
     times 256 - ($ - scancode_map) db 0
 
 section .bss
+
 boot_sector:
+
     resb 512
+
 cluster_buffer:
+
     resb 4096
+
 shift_pressed: resb 1
+
 idt:
+
     resb 256 * 8
+
+stack_bottom:
+
+    resb 4096
+
+stack_top:
+
+
+
+
+
+
