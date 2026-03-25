@@ -26,7 +26,21 @@ start:
     db 'PSOS BOOT ' ; Volume label
     db 'FAT12   ' ; Filesystem type
 
+; Write a single character directly to VGA text mode (0xB800:offset).
+; Uses GS as the VGA segment — set once at the top of start_boot and
+; left alone so it can be used anywhere without disturbing DS/ES.
+; Attribute 0x4F = white text on red background (hard to miss).
+%macro trace 2          ; trace char, vga_byte_offset
+    mov byte [gs:%2],   %1
+    mov byte [gs:%2+1], 0x4F
+%endmacro
+
 start_boot:
+    ; Point GS at the VGA text buffer for debug breadcrumbs.
+    mov ax, 0xB800
+    mov gs, ax
+    trace '?', 0        ; '?' = we reached start_boot
+
     ; Normalise segments and establish an explicit stack.
     ; Loading SS inhibits interrupts for the following instruction (SP load),
     ; guaranteeing an atomic SS:SP update.
@@ -36,6 +50,8 @@ start_boot:
     mov ss, ax
     mov sp, 0x7C00      ; stack grows down from boot sector base
 
+    trace '1', 2        ; '1' = segments + stack set up
+
     ; --- E820 memory map query ---
     ; Layout: dword entry count at 0x500, then 24-byte entries from 0x504.
     ; 24 bytes = 8 (base) + 8 (length) + 4 (type) + 4 (ACPI 3.0 attrs).
@@ -43,6 +59,7 @@ start_boot:
     mov dword [0x500], 0    ; initialise entry count
     mov di, 0x504           ; ES:DI = 0x0000:0x504 (ES=0 set above)
     xor ebx, ebx            ; EBX=0 starts the E820 enumeration
+    trace '2', 4        ; '2' = about to call int 0x15/E820
 
 .e820_loop:
     mov eax, 0xE820
@@ -58,6 +75,7 @@ start_boot:
     jnz .e820_loop
 
 .e820_done:
+    trace '3', 6        ; '3' = E820 done, about to load stage2
 
     ; Re-zero AX and ES: the BIOS E820 handler may have clobbered them.
     xor ax, ax
@@ -72,6 +90,7 @@ start_boot:
     ; dl is the drive number, passed by the BIOS
     mov bx, 0x8000 ; ES:BX load address (ES=0 set above)
     int 0x13
+    trace '4', 8        ; '4' = int 0x13 returned (stage2 should be loaded)
 
     jmp 0x0000:0x8000 ; Far jump to normalise CS=0 before stage2
 
