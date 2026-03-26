@@ -8,6 +8,12 @@ start_stage2:
     xor ax, ax
     mov ds, ax
 
+    ; Real-mode breadcrumb: confirm stage2 is actually loaded and running.
+    ; GS is still 0xB800 from boot.asm (never cleared in stage2), so
+    ; [GS:col*2] writes directly into the VGA text buffer without touching DS.
+    mov byte [gs:5*2],   '5'    ; col 5 = stage2 reached real-mode entry
+    mov byte [gs:5*2+1], 0x4F   ; white on red, same as boot.asm trace chars
+
     cli
     lgdt [gdt_descriptor]
     mov eax, cr0
@@ -15,26 +21,42 @@ start_stage2:
     mov cr0, eax
     jmp 0x08:protected_mode
 
+; Write a single VGA character (white on blue, 0x1F) directly via a flat
+; DS write. Only safe after DS has been loaded with the flat descriptor.
+; col is a byte column index; the byte offset is col*2.
+%macro pm_trace 2       ; pm_trace char, col
+    mov byte [0xb8000 + %2 * 2],     %1
+    mov byte [0xb8000 + %2 * 2 + 1], 0x1F
+%endmacro
+
 bits 32
 protected_mode:
     mov ax, 0x10
-    mov ds, ax
+    mov ds, ax          ; flat data segment — now safe to write anywhere
     mov es, ax
     mov fs, ax
     mov gs, ax
     mov ss, ax
     mov esp, stack_top
+    pm_trace 'A', 10    ; col 10: segments + stack set up
 
     call pic_remap
+    pm_trace 'B', 11    ; col 11: PIC remapped
+
     call idt_setup
     lidt [idt_descriptor]
+    pm_trace 'C', 12    ; col 12: IDT loaded
+
     sti
+    pm_trace 'D', 13    ; col 13: interrupts enabled
 
     mov edi, 0xb8000
     mov ecx, 80 * 25
     mov al, ' '
     mov ah, 0x17
     rep stosw
+
+    call print_e820_map
 
     mov edi, (5 * 80 + 25) * 2
     mov esi, ascii_art_line1
@@ -262,6 +284,76 @@ to_hex_char:
 .is_digit:
     add al, '0'
     ret
+
+; --- E820 memory map (written by boot.asm before PM switch) ---
+E820_COUNT   equ 0x500   ; dword: number of entries
+E820_ENTRIES equ 0x504   ; array of 24-byte entries:
+                         ;   +0  qword base address
+                         ;   +8  qword length
+                         ;   +16 dword type (1=usable,2=reserved,3=ACPI,4=NVS,5=bad)
+                         ;   +20 dword ACPI 3.0 extended attributes
+
+; print_e820_map
+; Reads the E820 map left by the bootloader and prints each entry to VGA.
+; Rows 0..(count-1), format: "BASE=XXXXXXXXXXXXXXXX LEN=XXXXXXXXXXXXXXXX TYPE=XXXXXXXX"
+; Clobbers: eax, ebx, ecx, edx, esi, edi
+print_e820_map:
+    mov ecx, [E820_COUNT]
+    test ecx, ecx
+    jz .done
+
+    mov ebx, E820_ENTRIES   ; pointer to current entry
+    xor edx, edx            ; row counter
+
+.entry_loop:
+    ; print_string_pm clobbers EBX (sets it to 0xb8000), so push/pop it
+    ; around every call to keep the entry pointer intact.
+    ; print_hex uses pushad/popad so it preserves EBX automatically.
+    ; edi is the VGA byte offset; print_string_pm advances it per char,
+    ; but print_hex does not — manually add 8*2 after each print_hex.
+
+    mov edi, edx
+    imul edi, 80 * 2        ; start of row
+
+    push ebx
+    mov esi, msg_e820_base
+    call print_string_pm    ; edi now past "BASE="
+    pop ebx
+    mov eax, [ebx + 4]      ; base high 32 bits
+    call print_hex
+    add edi, 8 * 2
+    mov eax, [ebx]          ; base low 32 bits
+    call print_hex
+    add edi, 8 * 2          ; advance past 16 hex digits total
+
+    push ebx
+    mov esi, msg_e820_len
+    call print_string_pm    ; edi now past " LEN="
+    pop ebx
+    mov eax, [ebx + 12]     ; length high 32 bits
+    call print_hex
+    add edi, 8 * 2
+    mov eax, [ebx + 8]      ; length low 32 bits
+    call print_hex
+    add edi, 8 * 2          ; advance past 16 hex digits total
+
+    push ebx
+    mov esi, msg_e820_type
+    call print_string_pm    ; edi now past " TYPE="
+    pop ebx
+    mov eax, [ebx + 16]     ; type
+    call print_hex
+
+    inc edx
+    add ebx, 24
+    loop .entry_loop
+
+.done:
+    ret
+
+msg_e820_base db 'BASE=', 0
+msg_e820_len  db ' LEN=', 0
+msg_e820_type db ' TYPE=', 0
 
 ; FAT12 Boot Sector Structure
 struc fat12_bpb
