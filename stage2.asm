@@ -15,20 +15,34 @@ start_stage2:
     mov cr0, eax
     jmp 0x08:protected_mode
 
+; Write a single VGA character (white on blue, 0x1F) directly via a flat
+; DS write. Only safe after DS has been loaded with the flat descriptor.
+; col is a byte column index; the byte offset is col*2.
+%macro pm_trace 2       ; pm_trace char, col
+    mov byte [0xb8000 + %2 * 2],     %1
+    mov byte [0xb8000 + %2 * 2 + 1], 0x1F
+%endmacro
+
 bits 32
 protected_mode:
     mov ax, 0x10
-    mov ds, ax
+    mov ds, ax          ; flat data segment — now safe to write anywhere
     mov es, ax
     mov fs, ax
     mov gs, ax
     mov ss, ax
     mov esp, stack_top
+    pm_trace 'A', 10    ; col 10: segments + stack set up
 
     call pic_remap
+    pm_trace 'B', 11    ; col 11: PIC remapped
+
     call idt_setup
     lidt [idt_descriptor]
+    pm_trace 'C', 12    ; col 12: IDT loaded
+
     sti
+    pm_trace 'D', 13    ; col 13: interrupts enabled
 
     mov edi, 0xb8000
     mov ecx, 80 * 25
