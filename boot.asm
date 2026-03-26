@@ -56,12 +56,17 @@ start_boot:
     ; Layout: dword entry count at 0x500, then 24-byte entries from 0x504.
     ; 24 bytes = 8 (base) + 8 (length) + 4 (type) + 4 (ACPI 3.0 attrs).
     ; Must be done in real mode before the protected-mode switch.
+    ; Buffer capacity: (0x7C00 - 0x504) / 24 = 1269 max; cap at 128 for safety.
+    push dx                 ; save boot drive number: the loop sets EDX=0x534D4150
+                            ; (DL='P') on every iteration, clobbering DL before int 0x13
     mov dword [0x500], 0    ; initialise entry count
     mov di, 0x504           ; ES:DI = 0x0000:0x504 (ES=0 set above)
     xor ebx, ebx            ; EBX=0 starts the E820 enumeration
     trace '2', 4        ; '2' = about to call int 0x15/E820
 
 .e820_loop:
+    cmp dword [0x500], 128  ; cap at 128 entries to protect the boot sector
+    jae .e820_done
     mov eax, 0xE820
     mov ecx, 24             ; request 24-byte (ACPI 3.0) entries
     mov edx, 0x534D4150     ; signature 'SMAP'
@@ -80,6 +85,7 @@ start_boot:
     ; Re-zero AX and ES: the BIOS E820 handler may have clobbered them.
     xor ax, ax
     mov es, ax
+    pop dx                  ; restore boot drive number (saved before E820 loop)
 
     ; Load stage2 from disk
     mov ah, 0x02 ; Read sectors
@@ -87,7 +93,7 @@ start_boot:
     mov ch, 0    ; Cylinder
     mov cl, 2    ; Sector to start reading from (1 is the boot sector)
     mov dh, 0    ; Head
-    ; dl is the drive number, passed by the BIOS
+    ; dl = boot drive number, restored above
     mov bx, 0x8000 ; ES:BX load address (ES=0 set above)
     int 0x13
     trace '4', 8        ; '4' = int 0x13 returned (stage2 should be loaded)

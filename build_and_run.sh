@@ -33,5 +33,7 @@ dd if=stage2.bin of=psos.img seek=1 bs=512 conv=notrunc
 # -monitor stdio : type 'info registers' in this terminal when hung
 echo "Booting PSOS in QEMU..."
 echo "Tip: type 'info registers' here when the screen hangs"
+echo "     interrupt log written to /tmp/qemu.log"
 qemu-system-x86_64 -k en-gb -drive file=psos.img,format=raw \
-    -no-reboot -monitor stdio
+    -no-reboot -monitor stdio \
+    -d int -D /tmp/qemu.log

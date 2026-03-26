@@ -8,6 +8,12 @@ start_stage2:
     xor ax, ax
     mov ds, ax
 
+    ; Real-mode breadcrumb: confirm stage2 is actually loaded and running.
+    ; GS is still 0xB800 from boot.asm (never cleared in stage2), so
+    ; [GS:col*2] writes directly into the VGA text buffer without touching DS.
+    mov byte [gs:5*2],   '5'    ; col 5 = stage2 reached real-mode entry
+    mov byte [gs:5*2+1], 0x4F   ; white on red, same as boot.asm trace chars
+
     cli
     lgdt [gdt_descriptor]
     mov eax, cr0
@@ -289,7 +295,7 @@ E820_ENTRIES equ 0x504   ; array of 24-byte entries:
 
 ; print_e820_map
 ; Reads the E820 map left by the bootloader and prints each entry to VGA.
-; Rows 0..(count-1), format: "BASE=XXXXXXXX LEN=XXXXXXXX TYPE=X"
+; Rows 0..(count-1), format: "BASE=XXXXXXXXXXXXXXXX LEN=XXXXXXXXXXXXXXXX TYPE=XXXXXXXX"
 ; Clobbers: eax, ebx, ecx, edx, esi, edi
 print_e820_map:
     mov ecx, [E820_COUNT]
@@ -313,17 +319,23 @@ print_e820_map:
     mov esi, msg_e820_base
     call print_string_pm    ; edi now past "BASE="
     pop ebx
+    mov eax, [ebx + 4]      ; base high 32 bits
+    call print_hex
+    add edi, 8 * 2
     mov eax, [ebx]          ; base low 32 bits
     call print_hex
-    add edi, 8 * 2          ; advance past 8 hex digits
+    add edi, 8 * 2          ; advance past 16 hex digits total
 
     push ebx
     mov esi, msg_e820_len
     call print_string_pm    ; edi now past " LEN="
     pop ebx
-    mov eax, [ebx + 8]      ; length low 32 bits
+    mov eax, [ebx + 12]     ; length high 32 bits
     call print_hex
     add edi, 8 * 2
+    mov eax, [ebx + 8]      ; length low 32 bits
+    call print_hex
+    add edi, 8 * 2          ; advance past 16 hex digits total
 
     push ebx
     mov esi, msg_e820_type
