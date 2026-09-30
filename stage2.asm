@@ -110,6 +110,8 @@ msg_test_pass db 'PASS', 0
 msg_test_fail db 'FAIL', 0
 msg_test_write_pass db 'WRITE PASS', 0
 msg_test_write_fail db 'WRITE FAIL', 0
+msg_test_pmm_pass db 'PMM PASS', 0
+msg_test_pmm_fail db 'PMM FAIL', 0
 
 test_read_boot_sector:
     ; Test if the boot sector is read correctly.
@@ -193,7 +195,91 @@ test_disk_write:
     call print_string_pm
     ret
 
+test_pmm:
+    ; Test the physical frame allocator.
+    ; 1. Allocate two frames: both outside the kernel, page aligned and
+    ;    different from each other.
+    ; 2. Check the free count dropped by two.
+    ; 3. Write a pattern to the first frame and read it back.
+    ; 4. Free the first frame and allocate again: the same frame comes back.
+    ; 5. Free both frames: the free count is back where it started.
+    ; 6. Free the first frame again: the double free is rejected.
+    push edi                ; VGA position for the result message
+    mov ebp, [pmm_free_count]
+
+    ; Step 1: Allocate two frames
+    call pmm_alloc_frame
+    jc .fail
+    mov ebx, eax
+    call pmm_alloc_frame
+    jc .fail
+    mov edx, eax
+
+    cmp ebx, bss_end
+    jb .fail
+    cmp edx, bss_end
+    jb .fail
+    test ebx, PMM_FRAME_SIZE - 1
+    jnz .fail
+    test edx, PMM_FRAME_SIZE - 1
+    jnz .fail
+    cmp ebx, edx
+    je .fail
+
+    ; Step 2: Two frames fewer are free
+    mov eax, ebp
+    sub eax, 2
+    cmp eax, [pmm_free_count]
+    jne .fail
+
+    ; Step 3: The frame is real, writable memory
+    mov dword [ebx], 0xDEADBEEF
+    cmp dword [ebx], 0xDEADBEEF
+    jne .fail
+
+    ; Step 4: A freed frame is handed out again
+    mov eax, ebx
+    call pmm_free_frame
+    jc .fail
+    call pmm_alloc_frame
+    jc .fail
+    cmp eax, ebx
+    jne .fail
+
+    ; Step 5: Free both frames
+    mov eax, ebx
+    call pmm_free_frame
+    jc .fail
+    mov eax, edx
+    call pmm_free_frame
+    jc .fail
+    cmp ebp, [pmm_free_count]
+    jne .fail
+
+    ; Step 6: Double free
+    mov eax, ebx
+    call pmm_free_frame
+    jnc .fail
+    cmp ebp, [pmm_free_count]
+    jne .fail
+
+    pop edi
+    mov esi, msg_test_pmm_pass
+    call print_string_pm
+    ret
+
+.fail:
+    pop edi
+    mov esi, msg_test_pmm_fail
+    call print_string_pm
+    ret
+
 run_tests:
+    ; The frame allocator test needs no disk, so it runs even if the
+    ; boot sector read below fails.
+    mov edi, (23 * 80 + 0) * 2
+    call test_pmm
+
     call fat_read_file
     jc .error               ; check CF before anything else can clobber it
 
