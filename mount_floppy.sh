@@ -3,7 +3,7 @@
 
 # --- Configuration ---
 # The name of your floppy disk image file.
-IMAGE_FILE="floppy.img"
+IMAGE_FILE="psos.img"
 
 # The temporary directory where the image will be mounted.
 MOUNT_POINT="/tmp/floppy_mnt"
