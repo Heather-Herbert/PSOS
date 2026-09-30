@@ -69,6 +69,7 @@ protected_mode:
     rep stosw
 
     call print_e820_map
+    call pmm_init
 
     mov edi, (5 * 80 + 25) * 2
     mov esi, ascii_art_line1
@@ -431,6 +432,221 @@ msg_e820_base db 'BASE=', 0
 msg_e820_len  db ' LEN=', 0
 msg_e820_type db ' TYPE=', 0
 
+; --- Physical memory manager: bitmap frame allocator ---
+; One bit per 4 KB frame over the whole 32-bit address space (set = in use).
+; Frame n covers physical addresses n * 4096 .. n * 4096 + 4095.
+PMM_FRAME_SHIFT   equ 12
+PMM_FRAME_SIZE    equ 1 << PMM_FRAME_SHIFT
+PMM_FRAMES        equ 1 << (32 - PMM_FRAME_SHIFT)
+PMM_BITMAP_DWORDS equ PMM_FRAMES / 32
+
+; pmm_init
+; Builds the frame bitmap from the E820 map left by the bootloader.
+; Everything starts out as used; only frames lying wholly inside a usable
+; (type 1) entry are freed. Non-usable entries are then marked used again
+; in a second pass, because E820 entries may overlap. Finally everything
+; from address 0 to the end of .bss is reserved: the real-mode IVT/BDA,
+; the E820 map itself, and the kernel image, bitmap and stack.
+; Memory above 4 GB cannot be addressed and is ignored.
+; Preserves all registers.
+pmm_init:
+    pushad
+
+    mov edi, pmm_bitmap
+    mov ecx, PMM_BITMAP_DWORDS
+    mov eax, 0xFFFFFFFF
+    cld
+    rep stosd
+    mov dword [pmm_free_count], 0
+    mov dword [pmm_hint], 0
+
+    ; Pass 1: free usable regions, rounded inwards to whole frames.
+    mov esi, E820_ENTRIES
+    mov ebx, [E820_COUNT]
+    test ebx, ebx
+    jz .reserve_kernel
+.usable_loop:
+    cmp dword [esi + 16], 1
+    jne .usable_next
+    mov ecx, PMM_FRAME_SIZE - 1     ; round the start up
+    xor edi, edi                    ; round the end down
+    call pmm_e820_range
+    call pmm_clear_range
+.usable_next:
+    add esi, 24
+    dec ebx
+    jnz .usable_loop
+
+    ; Pass 2: mark everything else used, rounded outwards.
+    mov esi, E820_ENTRIES
+    mov ebx, [E820_COUNT]
+.reserved_loop:
+    cmp dword [esi + 16], 1
+    je .reserved_next
+    xor ecx, ecx                    ; round the start down
+    mov edi, PMM_FRAME_SIZE - 1     ; round the end up
+    call pmm_e820_range
+    call pmm_set_range
+.reserved_next:
+    add esi, 24
+    dec ebx
+    jnz .reserved_loop
+
+.reserve_kernel:
+    ; Frame 0 is always inside this range, so pmm_alloc_frame can never
+    ; hand out address 0 and can use it to mean "out of memory".
+    xor eax, eax
+    mov edx, bss_end + PMM_FRAME_SIZE - 1
+    shr edx, PMM_FRAME_SHIFT
+    call pmm_set_range
+
+    popad
+    ret
+
+; pmm_e820_range
+; Converts an E820 entry to a frame range.
+; esi: E820 entry
+; ecx: bias added to the base before rounding down (0 or PMM_FRAME_SIZE - 1)
+; edi: bias added to the end before rounding down (0 or PMM_FRAME_SIZE - 1)
+; returns: eax = first frame, edx = end frame (exclusive), both clamped
+;          to PMM_FRAMES
+pmm_e820_range:
+    mov eax, [esi]
+    mov edx, [esi + 4]
+    add eax, ecx
+    adc edx, 0
+    call pmm_addr_to_frame
+    push eax
+
+    mov eax, [esi]
+    mov edx, [esi + 4]
+    add eax, [esi + 8]
+    adc edx, [esi + 12]
+    add eax, edi
+    adc edx, 0
+    call pmm_addr_to_frame
+    mov edx, eax
+    pop eax
+    ret
+
+; pmm_addr_to_frame
+; edx:eax: 64-bit physical address
+; returns: eax = frame number, clamped to PMM_FRAMES for addresses >= 4 GB
+pmm_addr_to_frame:
+    test edx, edx
+    jnz .clamp
+    shr eax, PMM_FRAME_SHIFT
+    ret
+.clamp:
+    mov eax, PMM_FRAMES
+    ret
+
+; pmm_clear_range / pmm_set_range
+; Mark frames eax..edx-1 free / used, keeping pmm_free_count in step.
+; Does nothing if eax >= edx. Clobbers eax.
+pmm_clear_range:
+.loop:
+    cmp eax, edx
+    jae .done
+    btr [pmm_bitmap], eax
+    jnc .next                       ; was already free
+    inc dword [pmm_free_count]
+.next:
+    inc eax
+    jmp .loop
+.done:
+    ret
+
+pmm_set_range:
+.loop:
+    cmp eax, edx
+    jae .done
+    bts [pmm_bitmap], eax
+    jc .next                        ; was already used
+    dec dword [pmm_free_count]
+.next:
+    inc eax
+    jmp .loop
+.done:
+    ret
+
+; pmm_alloc_frame
+; Allocates the lowest free 4 KB frame. Its contents are not cleared.
+; returns: eax = physical address of the frame, carry flag clear
+;          eax = 0 and carry flag set when out of memory
+; Preserves all other registers.
+pmm_alloc_frame:
+    push ecx
+    push edi
+
+    ; pmm_hint is the index of the first bitmap dword that can still have
+    ; a free bit, so full dwords below it are not rescanned every call.
+    mov edi, [pmm_hint]
+    mov ecx, PMM_BITMAP_DWORDS
+    sub ecx, edi
+    jz .oom
+    lea edi, [pmm_bitmap + edi * 4]
+    mov eax, 0xFFFFFFFF
+    cld
+    repe scasd
+    je .oom                         ; every remaining dword is full
+
+    sub edi, 4                      ; back to the dword with a free bit
+    mov eax, [edi]
+    not eax
+    bsf eax, eax                    ; lowest clear bit
+    bts [edi], eax
+    dec dword [pmm_free_count]
+
+    sub edi, pmm_bitmap             ; byte offset of that dword
+    mov ecx, edi
+    shr ecx, 2
+    mov [pmm_hint], ecx
+    lea eax, [eax + edi * 8]        ; frame number
+    shl eax, PMM_FRAME_SHIFT
+
+    pop edi
+    pop ecx
+    clc
+    ret
+
+.oom:
+    mov dword [pmm_hint], PMM_BITMAP_DWORDS
+    xor eax, eax
+    pop edi
+    pop ecx
+    stc
+    ret
+
+; pmm_free_frame
+; Returns a frame to the allocator.
+; eax: physical address inside the frame (as returned by pmm_alloc_frame)
+; returns: carry flag set, and nothing changed, if the frame is already
+;          free or lies in the kernel's own memory below bss_end
+; Preserves all registers.
+pmm_free_frame:
+    push eax
+    cmp eax, bss_end
+    jb .error
+    shr eax, PMM_FRAME_SHIFT
+    btr [pmm_bitmap], eax
+    jnc .error                      ; double free
+    inc dword [pmm_free_count]
+
+    shr eax, 5                      ; bitmap dword holding this frame
+    cmp eax, [pmm_hint]
+    jae .done
+    mov [pmm_hint], eax
+.done:
+    pop eax
+    clc
+    ret
+
+.error:
+    pop eax
+    stc
+    ret
+
 ; FAT12 Boot Sector Structure
 struc fat12_bpb
     .BS_jmpBoot         resb 3
@@ -763,6 +979,16 @@ shift_pressed: resb 1
 idt:
 
     resb 256 * 8
+
+alignb 4
+
+pmm_free_count: resd 1      ; number of free frames
+
+pmm_hint: resd 1            ; first bitmap dword that may have a free bit
+
+pmm_bitmap:
+
+    resd PMM_BITMAP_DWORDS
 
 stack_bottom:
 
