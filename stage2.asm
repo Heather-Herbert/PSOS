@@ -1,6 +1,8 @@
 bits 16
 org 0x8000
 
+%include "config.inc"
+
 start_stage2:
     ; Ensure DS=0 so that lgdt reads the GDT descriptor from the correct
     ; physical address. If DS is non-zero the CPU loads a garbage GDTR and
@@ -37,6 +39,16 @@ protected_mode:
     mov fs, ax
     mov gs, ax
     mov ss, ax
+
+    ; .bss is not part of the loaded image, so it holds whatever was in RAM.
+    ; Zero it (IDT, shift state, buffers, stack) before anything uses it.
+    ; No stack is needed here, so this runs before ESP is set.
+    mov edi, bss_start
+    mov ecx, bss_end - bss_start
+    xor eax, eax
+    cld
+    rep stosb
+
     mov esp, stack_top
     pm_trace 'A', 10    ; col 10: segments + stack set up
 
@@ -83,7 +95,10 @@ protected_mode:
     call cli_main
 
 halt:
+    ; Loop: each interrupt (e.g. a key press) wakes the CPU from hlt,
+    ; and without the jmp it would run on into the data below.
     hlt
+    jmp halt
 
 msg_test_pass db 'PASS', 0
 msg_test_fail db 'FAIL', 0
@@ -105,64 +120,81 @@ test_read_boot_sector:
     call print_string_pm
     ret
 
+; Scratch sector for the write test: the last sector of the 1.44MB disk.
+; It is in the FAT12 data area, well clear of the boot sector, stage2 and
+; both FATs, and its original contents are restored after the test.
+TEST_WRITE_LBA equ 2879
+
 test_disk_write:
     ; Test writing to disk.
-    ; 1. Read sector 10 into buffer.
-    ; 2. Modify buffer.
-    ; 3. Write sector 10.
-    ; 4. Read sector 10 into a different buffer (or same, clearing it first).
-    ; 5. Verify modification.
+    ; 1. Read the scratch sector into cluster_buffer.
+    ; 2. Save its first dword, replace it with a test pattern.
+    ; 3. Write the sector.
+    ; 4. Clear the buffer and read the sector back.
+    ; 5. Verify the pattern.
+    ; 6. Put the original dword back and rewrite the sector.
+    push edi                ; VGA position for the result message
 
-    ; Use cluster_buffer for this test.
-    
-    ; Step 1: Read Sector 10
-    mov eax, 10
+    ; Step 1: Read the scratch sector
+    mov eax, TEST_WRITE_LBA
     mov edi, cluster_buffer
     call ata_read_sector
     jc .fail
 
-    ; Step 2: Modify buffer (first dword)
+    ; Step 2: Save the original first dword, then modify it
+    push dword [cluster_buffer]
     mov dword [cluster_buffer], 0xDEADBEEF
 
-    ; Step 3: Write Sector 10
-    mov eax, 10
+    ; Step 3: Write the sector
+    mov eax, TEST_WRITE_LBA
+    mov esi, cluster_buffer
+    call ata_write_sector
+    jc .fail_saved          ; write may have partly happened; still restore
+
+    ; Step 4: Clear the buffer and read the sector again
+    mov dword [cluster_buffer], 0
+    mov eax, TEST_WRITE_LBA
+    mov edi, cluster_buffer
+    call ata_read_sector
+    jc .fail_saved
+
+    ; Step 5: Verify
+    cmp dword [cluster_buffer], 0xDEADBEEF
+    jne .fail_saved
+
+    ; Step 6: Restore the original contents
+    pop dword [cluster_buffer]
+    mov eax, TEST_WRITE_LBA
     mov esi, cluster_buffer
     call ata_write_sector
     jc .fail
 
-    ; Step 4: Clear buffer to ensure we are reading fresh data
-    mov dword [cluster_buffer], 0
-
-    ; Step 5: Read Sector 10 again
-    mov eax, 10
-    mov edi, cluster_buffer
-    call ata_read_sector
-    jc .fail
-
-    ; Step 6: Verify
-    cmp dword [cluster_buffer], 0xDEADBEEF
-    je .pass
-
-.fail:
-    mov esi, msg_test_write_fail
+    pop edi
+    mov esi, msg_test_write_pass
     call print_string_pm
     ret
 
-.pass:
-    mov esi, msg_test_write_pass
+.fail_saved:
+    ; Best-effort restore of the original dword; the rest of the buffer
+    ; still holds the sector's original bytes from step 1.
+    pop dword [cluster_buffer]
+    mov eax, TEST_WRITE_LBA
+    mov esi, cluster_buffer
+    call ata_write_sector
+.fail:
+    pop edi
+    mov esi, msg_test_write_fail
     call print_string_pm
     ret
 
 run_tests:
     call fat_read_file
+    jc .error               ; check CF before anything else can clobber it
 
     ; Print the first byte of the boot sector
-    mov al, [boot_sector]
-    movzx eax, al
+    movzx eax, byte [boot_sector]
     mov edi, (21 * 80 + 0) * 2 ; New line
     call print_hex
-
-    jc .error ; Now check the carry flag
 
     mov edi, (20 * 80 + 0) * 2
     call test_read_boot_sector
@@ -268,6 +300,22 @@ pic_remap:
     ret
 
 idt_setup:
+    ; Point vectors 0-31 (CPU exceptions) at their stubs so a fault
+    ; reports itself instead of triple-faulting through an empty IDT.
+    xor ecx, ecx
+.exc_loop:
+    mov eax, ecx
+    shl eax, 3                      ; stubs are EXC_STUB_SIZE (8) bytes apart
+    add eax, exception_stubs
+    mov word [idt + ecx * 8], ax
+    shr eax, 16
+    mov word [idt + ecx * 8 + 6], ax
+    mov word [idt + ecx * 8 + 2], 0x08
+    mov byte [idt + ecx * 8 + 5], 0x8E
+    inc ecx
+    cmp ecx, 32
+    jb .exc_loop
+
     mov eax, keyboard_isr
     mov word [idt + 0x21 * 8], ax
     shr eax, 16
@@ -275,6 +323,34 @@ idt_setup:
     mov word [idt + 0x21 * 8 + 2], 0x08
     mov byte [idt + 0x21 * 8 + 5], 0x8E
     ret
+
+; One fixed-size stub per CPU exception vector 0-31. Each pushes its
+; vector number and jumps to the common handler, so stub n lives at
+; exception_stubs + n * EXC_STUB_SIZE and idt_setup needs no table.
+EXC_STUB_SIZE equ 8
+exception_stubs:
+%assign vec 0
+%rep 32
+    push byte vec           ; 2 bytes; + 5-byte near jmp fits in 8
+    jmp exception_common
+    times exception_stubs + (vec + 1) * EXC_STUB_SIZE - $ db 0x90
+%assign vec vec + 1
+%endrep
+
+; Minimal fatal exception handler: print the vector number on the bottom
+; row and halt. (A full register dump is tracked in issue #20.)
+exception_common:
+    cli
+    mov edi, (24 * 80 + 0) * 2
+    mov esi, msg_exception
+    call print_string_pm
+    pop eax                 ; vector number pushed by the stub
+    call print_hex
+.hang:
+    hlt
+    jmp .hang
+
+msg_exception db 'CPU EXCEPTION ', 0
 
 to_hex_char:
     cmp al, 10
@@ -652,17 +728,27 @@ ascii_art_line7 db '  #       #####  #####  #####   ', 0
 scancode_map:
     db 0, 27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', 8, 9
     db 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', 13, 0
-    db 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`', 0, '#'
+    ; NASM has no backslash escapes in '...' strings, so the apostrophe is
+    ; written as "'" (a single-quoted '\'' would swallow the rest of the line).
+    db 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', "'", '`', 0, '#'
     db 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 0, '*', 0, ' ', 0
     times 128 - ($ - scancode_map) db 0
 
-    db 0, 27, '!', '"', '£', '$', '%', '^', '&', '*', '(', ')', '_', '+', 8, 9
+    ; 0x9C is the pound sign in VGA code page 437 (a literal '£' in this
+    ; UTF-8 source would assemble to two bytes and shift the table).
+    db 0, 27, '!', '"', 0x9C, '$', '%', '^', '&', '*', '(', ')', '_', '+', 8, 9
     db 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', 13, 0
     db 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '@', '~', 0, '~'
     db 'Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?', 0, '*', 0, ' ', 0
     times 256 - ($ - scancode_map) db 0
 
+%if ($ - $$) > STAGE2_SECTORS * 512
+    %error "stage2 is larger than STAGE2_SECTORS; raise it in config.inc"
+%endif
+
 section .bss
+
+bss_start:
 
 boot_sector:
 
@@ -684,8 +770,4 @@ stack_bottom:
 
 stack_top:
 
-
-
-
-
-
+bss_end:

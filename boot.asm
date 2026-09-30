@@ -1,6 +1,8 @@
 org 0x7c00
 bits 16
 
+%include "config.inc"
+
 start:
     jmp short start_boot
     nop
@@ -9,7 +11,7 @@ start:
     db 'PSOS    ' ; OEM Name
     dw 512      ; Bytes per sector
     db 1        ; Sectors per cluster
-    dw 1        ; Reserved sectors
+    dw RESERVED_SECTORS ; Reserved sectors (boot sector + stage2)
     db 2        ; Number of FATs
     dw 224      ; Root directory entries
     dw 2880     ; Total sectors
@@ -23,7 +25,7 @@ start:
     db 0        ; Reserved
     db 0x29     ; Extended boot signature
     dd 0x12345678 ; Volume serial number
-    db 'PSOS BOOT ' ; Volume label
+    db 'PSOS BOOT  ' ; Volume label (11 bytes)
     db 'FAT12   ' ; Filesystem type
 
 ; Write a single character directly to VGA text mode (0xB800:offset).
@@ -89,7 +91,7 @@ start_boot:
 
     ; Load stage2 from disk
     mov ah, 0x02 ; Read sectors
-    mov al, 4    ; Number of sectors to read
+    mov al, STAGE2_SECTORS ; Number of sectors to read
     mov ch, 0    ; Cylinder
     mov cl, 2    ; Sector to start reading from (1 is the boot sector)
     mov dh, 0    ; Head
