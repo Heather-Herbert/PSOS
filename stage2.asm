@@ -70,6 +70,11 @@ protected_mode:
 
     call print_e820_map
     call pmm_init
+    mov edi, (16 * 80 + 0) * 2
+    mov esi, msg_pmm_free
+    call print_string_pm
+    mov eax, [pmm_free_count]
+    call print_hex
 
     mov edi, (5 * 80 + 25) * 2
     mov esi, ascii_art_line1
@@ -439,6 +444,8 @@ PMM_FRAME_SHIFT   equ 12
 PMM_FRAME_SIZE    equ 1 << PMM_FRAME_SHIFT
 PMM_FRAMES        equ 1 << (32 - PMM_FRAME_SHIFT)
 PMM_BITMAP_DWORDS equ PMM_FRAMES / 32
+
+msg_pmm_free db 'PMM free frames: ', 0
 
 ; pmm_init
 ; Builds the frame bitmap from the E820 map left by the bootloader.
